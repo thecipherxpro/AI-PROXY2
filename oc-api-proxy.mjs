@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 
 const app = express();
 
@@ -29,14 +30,37 @@ function sanitizeEnvVar(value) {
   return value.trim().replace(/^["']|["']$/g, '');
 }
 
-function generateCanonicalId(prefix) {
-  const hex12 = Math.floor(Date.now()).toString(16).padStart(12, '0').slice(-12);
-  const base62Chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  let base62Tail = '';
-  for (let i = 0; i < 14; i++) {
-    base62Tail += base62Chars.charAt(Math.floor(Math.random() * base62Chars.length));
+const BASE62_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+let lastTimestamp = 0;
+let idCounter = 0;
+
+function createOpencodeId(prefix, descending = false) {
+  const timestamp = Date.now();
+  if (timestamp !== lastTimestamp) {
+    lastTimestamp = timestamp;
+    idCounter = 0;
   }
-  return `${prefix}_${hex12}${base62Tail}`;
+  idCounter++;
+
+  // OpenCode 48-bit layout: BigInt(timestamp) * 0x1000n + BigInt(idCounter)
+  const current = BigInt(timestamp) * 0x1000n + BigInt(idCounter);
+  const value = descending ? ~current : current;
+
+  // 6 bytes (12 hex chars)
+  let timeHex = '';
+  for (let i = 0; i < 6; i++) {
+    const byte = Number((value >> BigInt(40 - 8 * i)) & 0xffn);
+    timeHex += byte.toString(16).padStart(2, '0');
+  }
+
+  // 14 base62 random characters
+  let tail = '';
+  const randomBytes = crypto.randomBytes(14);
+  for (let i = 0; i < 14; i++) {
+    tail += BASE62_CHARS[randomBytes[i] % 62];
+  }
+
+  return `${prefix}_${timeHex}${tail}`;
 }
 
 function loadValidApiKeys() {
@@ -64,14 +88,13 @@ function isAuthorizedClient(req) {
 }
 
 async function callOpenCodeUpstream(targetModel, messages, temperature, top_p) {
-  const rawOpenCodeToken = sanitizeEnvVar(process.env.OPENCODE_SESSION_TOKEN);
-  
-  if (!rawOpenCodeToken || rawOpenCodeToken === 'public') {
-    throw new Error('OPENCODE_SESSION_TOKEN is missing or invalid in Hostinger Environment Variables.');
-  }
-
+  const rawOpenCodeToken = sanitizeEnvVar(process.env.OPENCODE_SESSION_TOKEN) || 'public';
   const upstreamAuth = rawOpenCodeToken.startsWith('Bearer ') ? rawOpenCodeToken : `Bearer ${rawOpenCodeToken}`;
   const upstreamUrl = 'https://opencode.ai/zen/v1/chat/completions';
+
+  // ses_ MUST be descending (true); msg_ MUST be ascending (false)
+  const sessionId = createOpencodeId('ses', true);
+  const requestId = createOpencodeId('msg', false);
 
   const bypassHeaders = {
     'Content-Type': 'application/json',
@@ -79,9 +102,11 @@ async function callOpenCodeUpstream(targetModel, messages, temperature, top_p) {
     'User-Agent': 'opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
     'x-opencode-client': 'cli',
     'x-opencode-version': '1.18.32',
-    'x-opencode-project': 'global',
-    'x-opencode-session': generateCanonicalId('ses'),
-    'x-opencode-request': generateCanonicalId('msg')
+    'x-opencode-project': 'prj_0000000000000000',
+    'x-opencode-session': sessionId,
+    'x-opencode-request': requestId,
+    'x-session-affinity': sessionId,
+    'x-session-id': sessionId
   };
 
   return await fetch(upstreamUrl, {
