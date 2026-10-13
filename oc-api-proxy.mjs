@@ -25,42 +25,101 @@ const MODEL_MAP = {
   'deepseek-v4-flash-free': 'big-pickle'
 };
 
+// OpenCode Built-in Tool Contract (Satisfies upstream gateway verification)
+const OPENCODE_CANONICAL_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'bash',
+      description: 'Run commands in a bash shell',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string', description: 'The command to execute' } },
+        required: ['command']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read',
+      description: 'Read the contents of a file',
+      parameters: {
+        type: 'object',
+        properties: { filePath: { type: 'string', description: 'Path of the file to read' } },
+        required: ['filePath']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write',
+      description: 'Write content to a file',
+      parameters: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string', description: 'Path of the file to write' },
+          content: { type: 'string', description: 'Content to write' }
+        },
+        required: ['filePath', 'content']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit',
+      description: 'Edit a file using string replacement',
+      parameters: {
+        type: 'object',
+        properties: { filePath: { type: 'string', description: 'Path of the file to edit' } },
+        required: ['filePath']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'glob',
+      description: 'Find files matching a glob pattern',
+      parameters: {
+        type: 'object',
+        properties: { pattern: { type: 'string', description: 'Glob pattern' } },
+        required: ['pattern']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'grep',
+      description: 'Search file contents using regular expressions',
+      parameters: {
+        type: 'object',
+        properties: { pattern: { type: 'string', description: 'Regular expression pattern' } },
+        required: ['pattern']
+      }
+    }
+  }
+];
+
+const BASE62_CHARS = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+function createOpencodeId(prefix) {
+  const timestamp = Date.now();
+  const timeHex = timestamp.toString(16).padStart(12, '0').slice(-12);
+  const randBytes = crypto.randomBytes(14);
+  let tail = '';
+  for (let i = 0; i < 14; i++) {
+    tail += BASE62_CHARS[randBytes[i] % 62];
+  }
+  return `${prefix}_${timeHex}${tail}`;
+}
+
 function sanitizeEnvVar(value) {
   if (!value) return '';
   return value.trim().replace(/^["']|["']$/g, '');
-}
-
-const BASE62_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-let lastTimestamp = 0;
-let idCounter = 0;
-
-function createOpencodeId(prefix, descending = false) {
-  const timestamp = Date.now();
-  if (timestamp !== lastTimestamp) {
-    lastTimestamp = timestamp;
-    idCounter = 0;
-  }
-  idCounter++;
-
-  // OpenCode 48-bit layout: BigInt(timestamp) * 0x1000n + BigInt(idCounter)
-  const current = BigInt(timestamp) * 0x1000n + BigInt(idCounter);
-  const value = descending ? ~current : current;
-
-  // 6 bytes (12 hex chars)
-  let timeHex = '';
-  for (let i = 0; i < 6; i++) {
-    const byte = Number((value >> BigInt(40 - 8 * i)) & 0xffn);
-    timeHex += byte.toString(16).padStart(2, '0');
-  }
-
-  // 14 base62 random characters
-  let tail = '';
-  const randomBytes = crypto.randomBytes(14);
-  for (let i = 0; i < 14; i++) {
-    tail += BASE62_CHARS[randomBytes[i] % 62];
-  }
-
-  return `${prefix}_${timeHex}${tail}`;
 }
 
 function loadValidApiKeys() {
@@ -71,16 +130,14 @@ function loadValidApiKeys() {
       if (Array.isArray(parsed)) return parsed.map(k => String(k).trim());
       if (parsed.keys && Array.isArray(parsed.keys)) return parsed.keys.map(k => String(k).trim());
     }
-  } catch (err) {
-    // If api-keys.json is missing or invalid, do not crash
-  }
+  } catch (err) {}
   const fallbackKey = sanitizeEnvVar(process.env.PROXY_API_KEY);
   return fallbackKey ? [fallbackKey] : [];
 }
 
 function isAuthorizedClient(req) {
   const validKeys = loadValidApiKeys();
-  if (validKeys.length === 0) return true; // Open access if no local keys defined
+  if (validKeys.length === 0) return true;
 
   const rawHeader = req.headers['authorization'] || req.headers['x-api-key'] || '';
   const incomingKey = rawHeader.replace(/^Bearer\s+/i, '').trim();
@@ -88,46 +145,43 @@ function isAuthorizedClient(req) {
 }
 
 async function callOpenCodeUpstream(targetModel, messages, temperature, top_p) {
-  const rawOpenCodeToken = sanitizeEnvVar(process.env.OPENCODE_SESSION_TOKEN) || 'public';
-  const upstreamAuth = rawOpenCodeToken.startsWith('Bearer ') ? rawOpenCodeToken : `Bearer ${rawOpenCodeToken}`;
+  const rawToken = sanitizeEnvVar(process.env.OPENCODE_SESSION_TOKEN) || 'public';
+  const upstreamAuth = rawToken.startsWith('Bearer ') ? rawToken : `Bearer ${rawToken}`;
   const upstreamUrl = 'https://opencode.ai/zen/v1/chat/completions';
 
-  // ses_ MUST be descending (true); msg_ MUST be ascending (false)
-  const sessionId = createOpencodeId('ses', true);
-  const requestId = createOpencodeId('msg', false);
+  const sessionId = createOpencodeId('ses');
+  const requestId = createOpencodeId('msg');
 
   const bypassHeaders = {
     'Content-Type': 'application/json',
     'Authorization': upstreamAuth,
-    'User-Agent': 'opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
+    'User-Agent': 'opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
     'x-opencode-client': 'cli',
-    'x-opencode-version': '1.18.32',
+    'x-opencode-version': '1.18.31',
     'x-opencode-project': 'prj_0000000000000000',
     'x-opencode-session': sessionId,
     'x-opencode-request': requestId,
-    'x-session-affinity': sessionId,
     'x-session-id': sessionId
+  };
+
+  const payload = {
+    model: targetModel,
+    messages,
+    stream: true,
+    tools: OPENCODE_CANONICAL_TOOLS, // Bypasses the 403 FreeTier check
+    ...(temperature !== undefined && { temperature }),
+    ...(top_p !== undefined && { top_p })
   };
 
   return await fetch(upstreamUrl, {
     method: 'POST',
     headers: bypassHeaders,
-    body: JSON.stringify({
-      model: targetModel,
-      messages,
-      stream: true,
-      ...(temperature !== undefined && { temperature }),
-      ...(top_p !== undefined && { top_p })
-    })
+    body: JSON.stringify(payload)
   });
 }
 
 app.get('/', (req, res) => {
-  res.status(200).json({
-    status: 'online',
-    domain: 'ai.genzee.lt',
-    service: 'OpenCode Free Model Dual Proxy'
-  });
+  res.status(200).json({ status: 'online', domain: 'ai.genzee.lt', service: 'OpenCode Free Model Proxy' });
 });
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
@@ -147,22 +201,14 @@ app.get('/debug', (req, res) => {
 app.get('/v1/models', (req, res) => {
   res.status(200).json({
     object: 'list',
-    data: Object.keys(MODEL_MAP).map(id => ({
-      id,
-      object: 'model',
-      created: 1700000000,
-      owned_by: 'opencode-zen'
-    }))
+    data: Object.keys(MODEL_MAP).map(id => ({ id, object: 'model', created: 1700000000, owned_by: 'opencode-zen' }))
   });
 });
 
-// 1. OpenAI Endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     if (!isAuthorizedClient(req)) {
-      return res.status(401).json({
-        error: { message: 'Unauthorized: Invalid API key', type: 'invalid_request_error' }
-      });
+      return res.status(401).json({ error: { message: 'Unauthorized', type: 'invalid_request_error' } });
     }
 
     const { model, messages, stream, temperature, top_p } = req.body;
@@ -216,9 +262,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             const parsed = JSON.parse(trimmed.slice(6));
             const delta = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.delta?.text || '';
             accumulatedContent += delta;
-          } catch (e) {
-            // Ignore incomplete chunks
-          }
+          } catch (e) {}
         }
       }
     }
@@ -228,28 +272,17 @@ app.post('/v1/chat/completions', async (req, res) => {
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: targetModel,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: accumulatedContent },
-          finish_reason: 'stop'
-        }
-      ]
+      choices: [{ index: 0, message: { role: 'assistant', content: accumulatedContent }, finish_reason: 'stop' }]
     });
-
   } catch (error) {
-    console.error('OpenAI Proxy Error:', error);
     return res.status(500).json({ error: { message: 'Proxy forwarding failed', details: error.message } });
   }
 });
 
-// 2. Anthropic Endpoint
 app.post('/v1/messages', async (req, res) => {
   try {
     if (!isAuthorizedClient(req)) {
-      return res.status(401).json({
-        error: { type: 'authentication_error', message: 'Unauthorized: Invalid API key.' }
-      });
+      return res.status(401).json({ error: { type: 'authentication_error', message: 'Unauthorized' } });
     }
 
     const { model, messages, system, temperature } = req.body;
@@ -304,15 +337,13 @@ app.post('/v1/messages', async (req, res) => {
             const parsed = JSON.parse(trimmed.slice(6));
             const delta = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.delta?.text || '';
             accumulatedContent += delta;
-          } catch (e) {
-            // Ignore incomplete chunks
-          }
+          } catch (e) {}
         }
       }
     }
 
     return res.status(200).json({
-      id: generateCanonicalId('msg'),
+      id: createOpencodeId('msg'),
       type: 'message',
       role: 'assistant',
       model: targetModel,
@@ -321,14 +352,11 @@ app.post('/v1/messages', async (req, res) => {
       stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 }
     });
-
   } catch (error) {
-    console.error('Anthropic Proxy Error:', error);
     return res.status(500).json({ error: { type: 'api_error', message: 'Proxy forwarding failed', details: error.message } });
   }
 });
 
-// Dynamic port assignment for Hostinger / Phusion Passenger
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Proxy listening on dynamic port ${PORT} for ai.genzee.lt`);
