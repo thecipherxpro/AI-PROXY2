@@ -33,6 +33,27 @@ function generateCanonicalId(prefix) {
   return `${prefix}_${hex12}${base62Tail}`;
 }
 
+// Client API key validator: enforces key if configured in Hostinger, otherwise open/public
+function checkClientAuth(req, res, next) {
+  const configuredKey = process.env.API_KEY || process.env.PROXY_API_KEY;
+  if (!configuredKey) {
+    return next(); // Public mode: No key required
+  }
+
+  const rawAuth = req.headers['authorization'] || req.headers['x-api-key'] || '';
+  const incomingKey = rawAuth.replace(/^Bearer\s+/i, '').trim();
+
+  if (incomingKey !== configuredKey.trim()) {
+    return res.status(401).json({
+      error: {
+        message: 'Unauthorized: Invalid or missing API key',
+        type: 'invalid_request_error'
+      }
+    });
+  }
+  next();
+}
+
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'online',
@@ -45,9 +66,12 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 
 app.get('/debug', (req, res) => {
   const envToken = process.env.OPENCODE_SESSION_TOKEN;
+  const configuredKey = process.env.API_KEY || process.env.PROXY_API_KEY;
   res.status(200).json({
+    domain: 'ai.genzee.lt',
     hasEnvToken: !!envToken && envToken !== 'public',
-    tokenPreview: envToken ? `${envToken.substring(0, 8)}...` : 'NONE'
+    tokenPreview: envToken ? `${envToken.substring(0, 8)}...` : 'NONE',
+    requiresApiKey: !!configuredKey
   });
 });
 
@@ -63,7 +87,7 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-app.post('/v1/chat/completions', async (req, res) => {
+app.post('/v1/chat/completions', checkClientAuth, async (req, res) => {
   try {
     const { model, messages, stream, temperature, top_p } = req.body;
 
@@ -71,13 +95,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       return res.status(400).json({ error: { message: 'Messages array is required' } });
     }
 
-    const incomingAuth = req.headers['authorization'];
+    // Upstream token selection: Default to 'Bearer public' for OpenCode Free Tier
     const envToken = process.env.OPENCODE_SESSION_TOKEN;
-    
     let activeToken = 'Bearer public';
-    if (incomingAuth && incomingAuth !== 'Bearer test' && incomingAuth !== 'Bearer public') {
-      activeToken = incomingAuth;
-    } else if (envToken && envToken !== 'public') {
+    if (envToken && envToken !== 'public' && !envToken.startsWith('oc_sk_')) {
       activeToken = envToken.startsWith('Bearer ') ? envToken : `Bearer ${envToken}`;
     }
 
@@ -141,10 +162,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      
+
       const chunk = decoder.decode(value, { stream: true });
       const lines = chunk.split('\n');
-      
+
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
