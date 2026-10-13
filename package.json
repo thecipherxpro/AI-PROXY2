@@ -1,13 +1,12 @@
 {
   "name": "ai-proxy2",
   "version": "1.0.0",
-  "type": "module",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
-    "express": "^4.21.0",
-    "opencode-ai": "latest"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
   }
 }
