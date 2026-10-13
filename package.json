@@ -1,6 +1,7 @@
 {
-  "name": "proxy-opencode",
+  "name": "free-opencode-proxy",
   "version": "1.0.0",
+  "description": "OpenCode Free Proxy for AI.cpxs.ca",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
@@ -8,5 +9,8 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
