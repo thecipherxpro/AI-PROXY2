@@ -1,7 +1,2 @@
-(async () => {
-  try {
-    await import('./oc-api-proxy.mjs');
-  } catch (err) {
-    console.error('Failed to load oc-api-proxy.mjs:', err);
-  }
-})();
+/ app.js - Hostinger Entry Point
+import "./oc-api-proxy.mjs";
