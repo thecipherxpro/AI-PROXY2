@@ -44,7 +44,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PROXY_PORT = Number(process.env.PROXY_PORT || 6447);
+const PROXY_PORT = Number(process.env.PORT || process.env.PROXY_PORT || 6447);
 const OC_SERVER = process.env.OC_SERVER;
 const OC_USERNAME = process.env.OC_USERNAME || "opencode";
 const OC_PASSWORD = process.env.OC_PASSWORD;
@@ -54,6 +54,7 @@ const REQUEST_TIMEOUT = Number(process.env.OC_TIMEOUT || 600) * 1000;
 
 function findBinary() {
   const candidates = [
+    path.join(HERE, "bin", "opencode"),
     path.join(os.homedir(), ".opencode", "bin", "opencode"),
     "/usr/local/bin/opencode",
     "/usr/bin/opencode",
