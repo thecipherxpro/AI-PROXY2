@@ -1,0 +1,17 @@
+{
+  "name": "free-opencode-proxy",
+  "version": "1.0.0",
+  "description": "OpenCode free models as OpenAI/Anthropic APIs, via the genuine opencode binary",
+  "type": "module",
+  "main": "oc-api-proxy.mjs",
+  "scripts": {
+    "start": "node oc-api-proxy.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
