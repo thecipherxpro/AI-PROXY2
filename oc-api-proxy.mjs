@@ -1,38 +1,4 @@
 // oc-api-proxy.mjs — OpenCode free models as OpenAI/Anthropic APIs.
-//
-// Why this exists: since ~2026-09-17 the OpenCode Zen free tier rejects every
-// client except the genuine opencode binary (TLS-fingerprint gate). Header
-// spoofing no longer works. This proxy drives the real binary's local
-// `opencode serve` API, so upstream calls are made by the genuine client.
-//
-// Usage:
-//   node oc-api-proxy.mjs                 # auto-spawns `opencode serve`
-//   OC_SERVER=http://127.0.0.1:13284 \    # or use an already-running server
-//   OC_PASSWORD=pass node oc-api-proxy.mjs
-//
-// Env:
-//   PROXY_PORT   port for this proxy          (default 6447)
-//   OC_BIN       path to opencode binary      (default ~/.opencode/bin/opencode)
-//   OC_WORKDIR   working dir for the agent    (default ./oc-workspace)
-//   OC_SERVER    reuse an existing opencode serve instance
-//   OC_USERNAME  basic-auth user for OC_SERVER (default "opencode")
-//   OC_PASSWORD  basic-auth password for OC_SERVER
-//   OC_TIMEOUT   per-request timeout in sec   (default 600)
-//
-// Session behavior:
-//   - Send header `x-oc-session: <name>` (or OpenAI `user` field, or
-//     Anthropic metadata.user_id) to get a persistent multi-turn conversation.
-//   - Without a key, every request is a fresh self-contained session whose
-//     full message history is replayed as a transcript. That session is
-//     deleted right after the reply so the opencode DB never fills up.
-//
-// Streaming: with stream=true we tap opencode's `GET /event` SSE and forward
-//   `message.part.delta` as tokens while the blocking prompt call is still
-//   running. If no delta ever shows up we fall back to the buffered reply.
-//
-// Limitation: client-supplied `tools` schemas are not forwarded; the opencode
-// agent runs its own built-in tools (read/edit/bash) server-side and folds
-// results into the reply text.
 
 import express from "express";
 import crypto from "crypto";
@@ -44,26 +10,35 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+// Hostinger provides the port via process.env.PORT
 const PROXY_PORT = Number(process.env.PORT || process.env.PROXY_PORT || 6447);
 const OC_SERVER = process.env.OC_SERVER;
 const OC_USERNAME = process.env.OC_USERNAME || "opencode";
 const OC_PASSWORD = process.env.OC_PASSWORD;
-const OC_BIN = process.env.OC_BIN || findBinary();
 const OC_WORKDIR = process.env.OC_WORKDIR || path.join(HERE, "oc-workspace");
 const REQUEST_TIMEOUT = Number(process.env.OC_TIMEOUT || 600) * 1000;
 
 function findBinary() {
   const candidates = [
-    path.join(HERE, "bin", "opencode"),
+    path.join(HERE, "node_modules", ".bin", "opencode"),
+    path.join(HERE, "node_modules", "opencode-ai", "bin", "opencode"),
+    path.join(process.cwd(), "node_modules", ".bin", "opencode"),
     path.join(os.homedir(), ".opencode", "bin", "opencode"),
     "/usr/local/bin/opencode",
     "/usr/bin/opencode",
   ];
-  for (const c of candidates) if (fs.existsSync(c)) return c;
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      try { fs.chmodSync(c, 0o755); } catch {}
+      return c;
+    }
+  }
   return "opencode";
 }
 
-// ── API keys (same scheme as server.mjs) ────────────────────────────
+const OC_BIN = process.env.OC_BIN || findBinary();
+
+// ── API keys ────────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || path.join(HERE, "api-keys.json");
 let apiKeys = {};
 function loadKeys() {
@@ -73,7 +48,7 @@ function loadKeys() {
       admin: "oc-" + crypto.randomBytes(20).toString("hex"),
       "user-default": "oc-" + crypto.randomBytes(20).toString("hex"),
     };
-    fs.writeFileSync(keysFile, JSON.stringify(apiKeys, null, 2));
+    try { fs.writeFileSync(keysFile, JSON.stringify(apiKeys, null, 2)); } catch {}
     console.log("[INIT] Generated new API keys →", keysFile);
   }
 }
@@ -89,9 +64,11 @@ function auth(req) {
 // ── opencode serve backend ──────────────────────────────────────────
 let ocBase = null;
 let ocAuth = null;
+let backendError = null;
 
 function ocReq(method, pathname, body) {
   return new Promise((resolve, reject) => {
+    if (!ocBase) return reject(new Error(backendError || "Backend not initialized"));
     const u = new URL(ocBase + pathname);
     const data = body !== undefined ? JSON.stringify(body) : null;
     const req = http.request(
@@ -132,14 +109,8 @@ async function startBackend() {
       : null;
     return;
   }
-  if (OC_BIN === "opencode" && !fs.existsSync("/usr/bin/opencode")) {
-    try {
-      const { execSync } = await import("child_process");
-      execSync("command -v opencode", { stdio: "ignore" });
-    } catch {
-      throw new Error("opencode binary not found — set OC_BIN or install opencode");
-    }
-  }
+  
+  console.log(`[OC] Using opencode binary at: ${OC_BIN}`);
   fs.mkdirSync(OC_WORKDIR, { recursive: true });
   const password = "oc-" + crypto.randomBytes(12).toString("hex");
   const child = spawn(OC_BIN, ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
@@ -147,6 +118,7 @@ async function startBackend() {
     cwd: OC_WORKDIR,
     stdio: ["ignore", "pipe", "pipe"],
   });
+
   child.on("exit", (code) => console.log("[OC] opencode serve exited with code", code));
   process.on("exit", () => { try { child.kill("SIGKILL"); } catch {} });
 
@@ -154,7 +126,9 @@ async function startBackend() {
     let buf = "";
     const timer = setTimeout(() => reject(new Error("opencode serve did not start within 45s")), 45000);
     const onData = (d) => {
-      buf += d.toString();
+      const str = d.toString();
+      buf += str;
+      console.log(`[OC CORE] ${str.trim()}`);
       const m = buf.match(/listening on https?:\/\/[^:]+:(\d+)/);
       if (m) { clearTimeout(timer); resolve(m[1]); }
     };
@@ -162,9 +136,10 @@ async function startBackend() {
     child.stderr.on("data", onData);
     child.on("exit", (c) => { clearTimeout(timer); reject(new Error(`opencode serve exited early (code ${c})`)); });
   });
+
   ocBase = `http://127.0.0.1:${port}`;
   ocAuth = "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
-  console.log(`[OC] opencode serve backend on ${ocBase}`);
+  console.log(`[OC] opencode serve backend ready on ${ocBase}`);
 
   for (let i = 0; i < 60; i++) {
     try {
@@ -227,7 +202,7 @@ function anthropicToPrompt(body) {
 }
 
 // ── sessions ────────────────────────────────────────────────────────
-const sessions = new Map(); // key -> { sessionID, turns, chain }
+const sessions = new Map();
 function sessionEntry(key) {
   if (!sessions.has(key)) sessions.set(key, { sessionID: null, turns: 0, chain: Promise.resolve() });
   return sessions.get(key);
@@ -247,10 +222,6 @@ function upstreamError(r) {
 async function ask({ key, system, modelId, transcript, lastUserText, onSession }) {
   const model = { modelID: modelId, providerID: "opencode" };
   if (!key) {
-    // stateless: fresh session, replay the whole transcript for context.
-    // the session exists only to serve this one request, so it is deleted as
-    // soon as the reply is in hand — only ever the id created in this call,
-    // keyed sessions and pre-existing ones are never touched.
     const created = await ocReq("POST", "/session", {});
     if (created.status !== 200) throw upstreamError(created);
     const sid = created.json.id;
@@ -267,8 +238,6 @@ async function ask({ key, system, modelId, transcript, lastUserText, onSession }
       );
     }
   }
-  // stateful: pin one opencode session per key; first turn replays the
-  // transcript, later turns send only the newest user message
   const entry = sessionEntry(key);
   const run = entry.chain.then(async () => {
     if (!entry.sessionID) {
@@ -488,12 +457,6 @@ function anthropicSink(res, modelId) {
   };
 }
 
-// ── live deltas: opencode's SSE /event ─────────────────────────────
-// POST /session/{id}/message blocks until the run finishes, but /event
-// emits `message.part.delta` while it is still generating — tap it to
-// forward real tokens. Deltas carry only a partID, so part types are
-// tracked from `message.part.updated` to tell reasoning from content.
-// If no delta ever shows up the sink falls back to the buffered reply.
 function connectEvents(watch) {
   let req = null;
   let done = false;
@@ -555,6 +518,16 @@ function connectEvents(watch) {
 // ── HTTP API ────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+
+// Landing Route for browser checks
+app.get("/", (_req, res) => {
+  res.json({
+    status: backendError ? "backend_initializing_or_error" : "online",
+    backend: ocBase || null,
+    error: backendError,
+    endpoints: ["/v1/chat/completions", "/v1/messages", "/v1/models", "/health"],
+  });
+});
 
 app.get("/v1/models", async (req, res) => {
   if (!auth(req)) return res.status(401).json({ error: { message: "Invalid API key" } });
@@ -661,12 +634,18 @@ app.post("/v1/messages", async (req, res) => {
 });
 
 app.get("/health", (_req, res) =>
-  res.json({ status: "ok", opencode: ocBase, models: modelCache ? modelCache.length : 0 })
+  res.json({
+    status: backendError ? "error" : "ok",
+    backendError: backendError || null,
+    opencode: ocBase,
+    models: modelCache ? modelCache.length : 0,
+  })
 );
 
 // ── start ───────────────────────────────────────────────────────────
+
 app.listen(PROXY_PORT, "0.0.0.0", async () => {
-  console.log(`oc-api-proxy on http://0.0.0.0:${PROXY_PORT}`);
+  console.log(`oc-api-proxy running on port ${PROXY_PORT}`);
   console.log("  OpenAI:    POST /v1/chat/completions");
   console.log("  Anthropic: POST /v1/messages");
   console.log("  Models:    GET  /v1/models");
@@ -675,8 +654,9 @@ app.listen(PROXY_PORT, "0.0.0.0", async () => {
     const models = await getModels();
     console.log("  Models:", models.join(", "));
   } catch (e) {
+    backendError = e.message;
     console.error("  Failed to start opencode backend:", e.message);
-    process.exit(1);
+    // Keep server running so Hostinger doesn't fail with a 503 and logs remain viewable
   }
   for (const [name, key] of Object.entries(apiKeys)) console.log(`  ${name.padEnd(15)} ${key}`);
 });
