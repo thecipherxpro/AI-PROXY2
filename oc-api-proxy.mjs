@@ -33,31 +33,10 @@ function generateCanonicalId(prefix) {
   return `${prefix}_${hex12}${base62Tail}`;
 }
 
-// Client API Key Gate: If API_KEY is set, enforce it. If not, allow public access.
-function checkClientAuth(req, res, next) {
-  const expectedKey = process.env.API_KEY || process.env.PROXY_API_KEY;
-  if (!expectedKey) {
-    return next(); // Public access mode
-  }
-
-  const rawAuth = req.headers['authorization'] || req.headers['x-api-key'] || '';
-  const clientKey = rawAuth.replace(/^Bearer\s+/i, '').trim();
-
-  if (clientKey !== expectedKey.trim()) {
-    return res.status(401).json({
-      error: {
-        message: 'Invalid or missing API key',
-        type: 'invalid_request_error'
-      }
-    });
-  }
-  next();
-}
-
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'online',
-    domain: 'ai.genzee.lt',
+    domain: 'AI.cpxs.ca',
     service: 'OpenCode Free Model Bypass Proxy'
   });
 });
@@ -66,12 +45,9 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 
 app.get('/debug', (req, res) => {
   const envToken = process.env.OPENCODE_SESSION_TOKEN;
-  const configuredKey = process.env.API_KEY || process.env.PROXY_API_KEY;
   res.status(200).json({
-    domain: 'ai.genzee.lt',
     hasEnvToken: !!envToken && envToken !== 'public',
-    tokenPreview: envToken ? `${envToken.substring(0, 8)}...` : 'NONE',
-    requiresApiKey: !!configuredKey
+    tokenPreview: envToken ? `${envToken.substring(0, 8)}...` : 'NONE'
   });
 });
 
@@ -87,7 +63,7 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-app.post('/v1/chat/completions', checkClientAuth, async (req, res) => {
+app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, stream, temperature, top_p } = req.body;
 
@@ -95,10 +71,13 @@ app.post('/v1/chat/completions', checkClientAuth, async (req, res) => {
       return res.status(400).json({ error: { message: 'Messages array is required' } });
     }
 
-    // Always use Hostinger OPENCODE_SESSION_TOKEN for upstream OpenCode calls
+    const incomingAuth = req.headers['authorization'];
     const envToken = process.env.OPENCODE_SESSION_TOKEN;
+    
     let activeToken = 'Bearer public';
-    if (envToken && envToken !== 'public') {
+    if (incomingAuth && incomingAuth !== 'Bearer test' && incomingAuth !== 'Bearer public') {
+      activeToken = incomingAuth;
+    } else if (envToken && envToken !== 'public') {
       activeToken = envToken.startsWith('Bearer ') ? envToken : `Bearer ${envToken}`;
     }
 
@@ -162,10 +141,10 @@ app.post('/v1/chat/completions', checkClientAuth, async (req, res) => {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
+      
       const chunk = decoder.decode(value, { stream: true });
       const lines = chunk.split('\n');
-
+      
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
@@ -206,5 +185,5 @@ app.post('/v1/chat/completions', checkClientAuth, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Bypass Proxy running on port ${PORT} for ai.genzee.lt`);
+  console.log(`Bypass Proxy running on port ${PORT} for AI.cpxs.ca`);
 });
